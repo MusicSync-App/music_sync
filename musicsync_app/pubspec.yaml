@@ -65,6 +65,7 @@ flutter:
     - assets/images/turkey/
     - assets/geo/countries.json
     - assets/geo/places.json
+    - assets/radio/stations_bundle.json.gz
 
 msix_config:
   display_name: MusicSync

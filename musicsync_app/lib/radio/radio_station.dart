@@ -38,6 +38,10 @@ class RadioStation {
   /// Adăugat manual de utilizator (nu vine din Radio Browser).
   final bool isManual;
 
+  /// Frecvența FM declarată de catalogul inclus în aplicație (ex. "90.8"),
+  /// când nu apare în nume.
+  final String frequency;
+
   final LocationPrecision precision;
 
   const RadioStation({
@@ -60,10 +64,12 @@ class RadioStation {
     this.lon,
     this.isManual = false,
     this.precision = LocationPrecision.exact,
+    this.frequency = '',
   });
 
   /// Copie plasată pe hartă (pentru posturile fără coordonate).
-  RadioStation withLocation(double lat, double lon, LocationPrecision precision) => RadioStation(
+  /// [state] înlocuiește orașul declarat (doar dacă e dat).
+  RadioStation withLocation(double lat, double lon, LocationPrecision precision, {String? state}) => RadioStation(
         uuid: uuid,
         name: name,
         streamUrl: streamUrl,
@@ -71,7 +77,7 @@ class RadioStation {
         favicon: favicon,
         countryCode: countryCode,
         country: country,
-        state: state,
+        state: state ?? this.state,
         tags: tags,
         codec: codec,
         bitrate: bitrate,
@@ -83,6 +89,7 @@ class RadioStation {
         lon: lon,
         isManual: isManual,
         precision: precision,
+        frequency: frequency,
       );
 
   bool get hasLocation => lat != null && lon != null;
@@ -90,7 +97,8 @@ class RadioStation {
   /// Frecvența FM, dacă apare în numele postului (ex. "Republic 100.3").
   String? get fmFrequency {
     final m = _fmFrequency.firstMatch(name);
-    return m == null ? null : '${m.group(1)}.${m.group(2)} FM';
+    if (m != null) return '${m.group(1)}.${m.group(2)} FM';
+    return frequency.isEmpty ? null : '$frequency FM';
   }
 
   /// Distanța doar când poziția înseamnă ceva (nu pentru posturile
@@ -147,6 +155,7 @@ class RadioStation {
         'lon': lon,
         'isManual': isManual,
         if (precision != LocationPrecision.exact) 'precision': precision.name,
+        if (frequency.isNotEmpty) 'frequency': frequency,
       };
 
   factory RadioStation.fromJson(Map<String, dynamic> j) => RadioStation(
@@ -169,5 +178,6 @@ class RadioStation {
         lon: _toDouble(j['lon']),
         isManual: j['isManual'] == true,
         precision: LocationPrecision.values.asNameMap()[j['precision']] ?? LocationPrecision.exact,
+        frequency: j['frequency'] as String? ?? '',
       );
 }
