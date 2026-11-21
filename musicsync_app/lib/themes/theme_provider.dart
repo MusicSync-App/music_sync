@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'app_themes.dart';
 import 'theme_photos.dart';
+import 'country_detector.dart' show kDefaultThemeId;
+import 'user_themes.dart';
 import 'dart:math';
 
 const String _kAutoThemePrefsKey = 'auto_theme_enabled';
@@ -22,6 +24,26 @@ class ThemeProvider extends ChangeNotifier {
     // Selectează o imagine random pentru tema inițială (Grecia) la pornirea aplicației
     _pickRandomImage();
     _loadAutoThemePref();
+    UserThemes.instance.addListener(_onUserThemesChanged);
+  }
+
+  /// O țară adăugată a fost ștearsă (sau modificată) — dacă era activă,
+  /// revenim la Grecia / reconstruim tema cu culorile noi.
+  void _onUserThemesChanged() {
+    final latest = appThemes[_currentTheme.id];
+    if (latest == null) {
+      switchTheme(kDefaultThemeId);
+    } else if (!identical(latest, _currentTheme)) {
+      _currentTheme = latest;
+      _pickRandomImage();
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    UserThemes.instance.removeListener(_onUserThemesChanged);
+    super.dispose();
   }
 
   Future<void> _loadAutoThemePref() async {

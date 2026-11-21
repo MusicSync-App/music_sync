@@ -27,8 +27,49 @@ const Map<String, String> kCountryCodeToTheme = {
   'TM': 'central asia',
 };
 
-String themeForCountryCode(String? countryCode) =>
-    kCountryCodeToTheme[(countryCode ?? '').toUpperCase()] ?? kDefaultThemeId;
+String themeForCountryCode(String? countryCode) {
+  final code = (countryCode ?? '').toUpperCase();
+  // O țară adăugată de utilizator are prioritate (ex. "Serbia" separat de Bosnia).
+  for (final rule in _customRules.values) {
+    if (rule.countryCode == code) return rule.themeId;
+  }
+  return kCountryCodeToTheme[code] ?? kDefaultThemeId;
+}
+
+// ── Teme adăugate de utilizator ("Adaugă țară") ─────────────────────────────
+
+class _CustomRule {
+  final String themeId;
+  final String? countryCode;
+  final List<RegExp> patterns;
+  _CustomRule(this.themeId, this.countryCode, this.patterns);
+}
+
+final Map<String, _CustomRule> _customRules = {};
+
+/// Caracterele speciale în regex — fără '-' (în modul unicode `\-` e eroare).
+String _escapeLiteral(String s) => s.replaceAllMapped(RegExp(r'[\\^$.|?*+()\[\]{}/]'), (m) => '\\${m[0]}');
+
+/// Cuvintele-cheie scrise de utilizator: text simplu (nu regex), potrivit la
+/// începutul unui cuvânt, fără diferență de majuscule.
+RegExp customKeywordPattern(String keyword) =>
+    RegExp(r'(?:^|[^\p{L}])' + _escapeLiteral(keyword.trim()), unicode: true, caseSensitive: false);
+
+/// Înregistrează (sau înlocuiește) regulile de detecție ale unei teme
+/// adăugate de utilizator.
+void registerCustomTheme(String themeId, {String? countryCode, Iterable<String> keywords = const []}) {
+  final words = keywords.map((k) => k.trim()).where((k) => k.length >= 2).toSet();
+  _customRules[themeId] = _CustomRule(
+    themeId,
+    countryCode?.toUpperCase(),
+    words.map(customKeywordPattern).toList(),
+  );
+}
+
+void unregisterCustomTheme(String themeId) => _customRules.remove(themeId);
+
+/// Pentru teste.
+void clearCustomThemes() => _customRules.clear();
 
 /// Cuvinte-cheie (fragmente regex, potrivite la începutul unui cuvânt).
 const Map<String, List<String>> _keywords = {
@@ -101,6 +142,9 @@ Set<String> _keywordHits(String text) {
   _keywordPatterns.forEach((themeId, patterns) {
     if (patterns.any((r) => r.hasMatch(text))) hits.add(themeId);
   });
+  for (final rule in _customRules.values) {
+    if (rule.patterns.any((r) => r.hasMatch(text))) hits.add(rule.themeId);
+  }
   return hits;
 }
 
