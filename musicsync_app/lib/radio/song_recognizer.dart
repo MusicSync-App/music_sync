@@ -1,25 +1,31 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'compressed_audio.dart';
 import 'disk_cache.dart';
+import 'pcm_audio.dart';
+import 'shazam_client.dart';
+import 'shazam_signature.dart';
 
-const String _kTokenKey = 'audd_api_token';
 const String _kHistoryKey = 'song_recognition_history';
 const int _kMaxHistory = 200;
 
-/// Shazam nu oferă API sau autentificare pentru aplicații terțe, așa că
-/// recunoașterea folosește AudD (aceeași idee: amprentă audio -> melodie),
-/// cu un token personal introdus o singură dată.
-const String kRecognitionDashboardUrl = 'https://dashboard.audd.io/';
+/// Câte secunde de audio intră în amprentă (ca aplicația Shazam / SongRec).
+const int kRecognitionSeconds = 12;
 
+/// Recunoașterea calculează local amprenta audio Shazam (port Dart al
+/// algoritmului public din SongRec / shazamio) și o trimite serviciului
+/// Shazam — gratuit, fără cont sau token.
 class RecognizedSong {
   final String title;
   final String artist;
@@ -31,6 +37,10 @@ class RecognizedSong {
   /// Postul de radio pe care rula, dacă e cazul.
   final String? stationName;
 
+  /// 'shazam' — recunoscută după sunet; 'icy' — luată din titlul transmis
+  /// de post (când Shazam nu a găsit-o / nu a putut fi contactat).
+  final String source;
+
   const RecognizedSong({
     required this.title,
     required this.artist,
@@ -39,6 +49,7 @@ class RecognizedSong {
     this.songLink = '',
     required this.recognizedAt,
     this.stationName,
+    this.source = 'shazam',
   });
 
   String get youtubeSearchUrl =>
@@ -52,6 +63,7 @@ class RecognizedSong {
         'songLink': songLink,
         'recognizedAt': recognizedAt.toIso8601String(),
         if (stationName != null) 'stationName': stationName,
+        'source': source,
       };
 
   factory RecognizedSong.fromJson(Map<String, dynamic> j) => RecognizedSong(
@@ -62,7 +74,25 @@ class RecognizedSong {
         songLink: j['songLink'] as String? ?? '',
         recognizedAt: DateTime.tryParse(j['recognizedAt'] as String? ?? '') ?? DateTime.now(),
         stationName: j['stationName'] as String?,
+        source: j['source'] as String? ?? 'shazam',
       );
+}
+
+/// Interpretează titlul ICY ("Artist - Titlu") transmis de post. Întoarce
+/// null pentru reclame, jingle-uri, numele postului etc.
+({String artist, String title})? parseIcyTitle(String? raw, {String? stationName}) {
+  final t = raw?.trim() ?? '';
+  if (t.isEmpty) return null;
+  final lower = t.toLowerCase();
+  const junk = ['ad_start', 'ad_end', 'advert', 'commercial', 'jingle', 'unknown', 'live', 'on air', 'diafimis'];
+  if (junk.any((j) => lower == j || lower.startsWith('$j ') || lower.startsWith('$j-'))) return null;
+  if (stationName != null && lower.contains(stationName.trim().toLowerCase())) return null;
+  final sep = t.indexOf(' - ');
+  if (sep <= 0) return null;
+  final artist = t.substring(0, sep).trim();
+  final title = t.substring(sep + 3).trim();
+  if (artist.isEmpty || title.isEmpty) return null;
+  return (artist: artist, title: title);
 }
 
 /// Poziția secvenței "\r\n\r\n" care încheie antetele unui răspuns HTTP/ICY
@@ -81,66 +111,33 @@ class RecognitionException implements Exception {
   String toString() => message;
 }
 
+/// Calculează cât din stream trebuie citit: când recunoaște formatul (MP3 /
+/// AAC) ia ~[kRecognitionSeconds]+2 s după debitul real, altfel [fallback].
+class CaptureTarget {
+  final int fallback;
+  int? _target;
+  CaptureTarget(this.fallback);
+
+  int bytesFor(Uint8List body) {
+    if (_target != null) return _target!;
+    if (body.length < 16384) return fallback;
+    final info = sniffCompressedAudio(body);
+    _target = info == null
+        ? fallback
+        : (info.offset + info.bytesPerSecond * (kRecognitionSeconds + 2)).clamp(48000, 900000);
+    return _target!;
+  }
+}
+
 class SongRecognizer {
   final AudioRecorder _recorder = AudioRecorder();
+  final ShazamClient _shazam = ShazamClient();
+
+  static const MethodChannel _decoderChannel = MethodChannel('musicsync/audio_decoder');
 
   void dispose() {
     _recorder.dispose();
-  }
-
-  // ── Cont / token ──────────────────────────────────────────────────────────
-
-  // Tokenul rămâne la actualizări (setările aplicației se păstrează), iar o
-  // copie în folderul de muzică îl recuperează și după o reinstalare.
-  static File? get _tokenBackupFile =>
-      Platform.isAndroid ? File('/storage/emulated/0/Music/MusicSync/.musicsync_audd_token') : null;
-
-  static Future<String?> getToken() async {
-    final prefs = await SharedPreferences.getInstance();
-    final t = prefs.getString(_kTokenKey)?.trim();
-    final backup = _tokenBackupFile;
-    if (t != null && t.isNotEmpty) {
-      // Tokenurile salvate înainte de existența copiei primesc și ele una.
-      try {
-        if (backup != null && !await backup.exists()) {
-          await backup.parent.create(recursive: true);
-          await backup.writeAsString(t, flush: true);
-        }
-      } catch (_) {}
-      return t;
-    }
-    try {
-      if (backup != null && await backup.exists()) {
-        final restored = (await backup.readAsString()).trim();
-        if (restored.isNotEmpty) {
-          await prefs.setString(_kTokenKey, restored);
-          return restored;
-        }
-      }
-    } catch (_) {
-      // Fără acces la stocare — doar tokenul din setări contează.
-    }
-    return null;
-  }
-
-  static Future<void> setToken(String? token) async {
-    final prefs = await SharedPreferences.getInstance();
-    final value = token?.trim() ?? '';
-    final backup = _tokenBackupFile;
-    if (value.isEmpty) {
-      await prefs.remove(_kTokenKey);
-      try {
-        if (backup != null && await backup.exists()) await backup.delete();
-      } catch (_) {}
-    } else {
-      await prefs.setString(_kTokenKey, value);
-      try {
-        if (backup != null) {
-          await backup.parent.create(recursive: true);
-          await backup.writeAsString(value, flush: true);
-        }
-      } catch (_) {}
-    }
+    _shazam.close();
   }
 
   // ── Istoric ───────────────────────────────────────────────────────────────
@@ -179,14 +176,14 @@ class SongRecognizer {
     return File(p.join(dir.path, 'recognize_${DateTime.now().millisecondsSinceEpoch}.$ext'));
   }
 
-  /// Înregistrează de la microfon.
+  /// Înregistrează de la microfon, direct PCM (WAV 16 kHz mono).
   Future<File> recordMicrophone(Duration duration) async {
     if (!await _recorder.hasPermission()) {
       throw RecognitionException('Permisiunea pentru microfon a fost refuzată.');
     }
-    final file = await _tempFile('m4a');
+    final file = await _tempFile('wav');
     await _recorder.start(
-      const RecordConfig(encoder: AudioEncoder.aacLc, sampleRate: 44100, numChannels: 1),
+      const RecordConfig(encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1),
       path: file.path,
     );
     await Future.delayed(duration);
@@ -195,100 +192,204 @@ class SongRecognizer {
     return File(path);
   }
 
-  /// Ia direct ~15 secunde din stream-ul radio (mai exact decât microfonul,
+  /// Ia direct ~14 secunde din stream-ul radio (mai exact decât microfonul,
   /// fără zgomot de fundal). Nu merge pentru stream-uri HLS (.m3u8).
   Future<File> captureStream(String streamUrl, {int maxBytes = 260000}) async {
-    Uint8List data;
-    try {
-      data = await _captureHttp(streamUrl, maxBytes);
-    } on RecognitionException {
-      rethrow;
-    } catch (_) {
-      // Servere SHOUTcast vechi răspund "ICY 200 OK" în loc de "HTTP/1.1 200 OK"
-      // și clientul HTTP le respinge ("Invalid response line") — citim direct.
-      data = await _captureRaw(Uri.parse(streamUrl), maxBytes);
-    }
-
+    final data = await captureStreamBytes(streamUrl, maxBytes: maxBytes);
     if (data.length < 40000) {
       throw RecognitionException('Prea puține date din stream pentru recunoaștere.');
     }
-    final type = streamUrl.toLowerCase().contains('aac') ? 'aac' : 'mp3';
+    final info = sniffCompressedAudio(data);
+    final type = info?.format ?? (streamUrl.toLowerCase().contains('aac') ? 'aac' : 'mp3');
+    // Fragmentul începe la mijlocul unui cadru — decodorul vrea un cadru întreg.
+    final aligned = info == null ? data : Uint8List.sublistView(data, info.offset);
     final file = await _tempFile(type);
-    await file.writeAsBytes(data, flush: true);
+    await file.writeAsBytes(aligned, flush: true);
     return file;
   }
 
-  Future<Uint8List> _captureHttp(String streamUrl, int maxBytes) async {
-    final client = http.Client();
-    final bytes = BytesBuilder(copy: false);
-    try {
-      final request = http.Request('GET', Uri.parse(streamUrl))..headers['User-Agent'] = kHttpUserAgent;
-      final response = await client.send(request).timeout(const Duration(seconds: 15));
-      if (response.statusCode != 200) {
-        throw RecognitionException('Stream-ul a răspuns cu HTTP ${response.statusCode}.');
-      }
-      final done = Completer<void>();
-      late StreamSubscription<List<int>> sub;
-      sub = response.stream.listen(
-        (chunk) {
-          bytes.add(chunk);
-          if (bytes.length >= maxBytes && !done.isCompleted) done.complete();
-        },
-        onDone: () => done.isCompleted ? null : done.complete(),
-        onError: (Object e) => done.isCompleted ? null : done.completeError(e),
-        cancelOnError: true,
-      );
-      await done.future.timeout(const Duration(seconds: 25), onTimeout: () {});
-      await sub.cancel();
-    } finally {
-      client.close();
-    }
-    return bytes.takeBytes();
-  }
-
-  Future<Uint8List> _captureRaw(Uri uri, int maxBytes) => captureRawStream(uri, maxBytes);
-
   // ── Recunoaștere ──────────────────────────────────────────────────────────
 
-  /// Trimite fragmentul audio la serviciu. Întoarce null dacă nu s-a găsit
-  /// nicio potrivire. Fișierul temporar e șters la final.
-  Future<RecognizedSong?> recognize(File audio, {required String token, String? stationName}) async {
+  /// Recunoaște melodia din fișierul audio (WAV de la microfon sau MP3/AAC
+  /// din stream). Întoarce null dacă nu s-a găsit nicio potrivire. Dacă
+  /// Shazam nu o găsește dar postul transmite titlul ([icyTitle]), îl
+  /// folosește pe acela. Fișierul temporar e șters la final.
+  Future<RecognizedSong?> recognize(File audio, {String? stationName, String? icyTitle}) async {
+    final icy = parseIcyTitle(icyTitle, stationName: stationName);
+    RecognizedSong? fromIcy() => icy == null
+        ? null
+        : RecognizedSong(
+            title: icy.title,
+            artist: icy.artist,
+            recognizedAt: DateTime.now(),
+            stationName: stationName,
+            source: 'icy',
+          );
+
     try {
-      final request = http.MultipartRequest('POST', Uri.parse('https://api.audd.io/'))
-        ..fields['api_token'] = token
-        ..files.add(await http.MultipartFile.fromPath('file', audio.path));
-      final streamed = await request.send().timeout(const Duration(seconds: 40));
-      final body = await streamed.stream.bytesToString();
-      final decoded = jsonDecode(body) as Map<String, dynamic>;
-
-      if (decoded['status'] != 'success') {
-        final err = decoded['error'];
-        final message = err is Map ? (err['error_message'] ?? err['error_code']) : body;
-        throw RecognitionException('Serviciul de recunoaștere: $message');
+      final Int16List pcm;
+      try {
+        pcm = await decodeToMono16k(audio);
+      } on RecognitionException {
+        final fallback = fromIcy();
+        if (fallback != null) return fallback;
+        rethrow;
       }
+      if (pcm.length < 16000 * 3) {
+        throw RecognitionException('Fragment audio prea scurt pentru recunoaștere.');
+      }
+      final signature = await computeSignature(pcm);
 
-      final result = decoded['result'];
-      if (result is! Map) return null;
+      final ShazamMatch? match;
+      try {
+        match = await _shazam.recognize(signature);
+      } on ShazamException {
+        final fallback = fromIcy();
+        if (fallback != null) return fallback;
+        rethrow;
+      } on TimeoutException {
+        final fallback = fromIcy();
+        if (fallback != null) return fallback;
+        throw RecognitionException('Serviciul de recunoaștere nu a răspuns la timp.');
+      } on SocketException {
+        final fallback = fromIcy();
+        if (fallback != null) return fallback;
+        throw RecognitionException('Serviciul de recunoaștere nu poate fi contactat.');
+      } on http.ClientException {
+        final fallback = fromIcy();
+        if (fallback != null) return fallback;
+        throw RecognitionException('Serviciul de recunoaștere nu poate fi contactat.');
+      }
+      if (match == null) return fromIcy();
 
       return RecognizedSong(
-        title: result['title'] as String? ?? '',
-        artist: result['artist'] as String? ?? '',
-        album: result['album'] as String? ?? '',
-        releaseDate: result['release_date'] as String? ?? '',
-        songLink: result['song_link'] as String? ?? '',
+        title: match.title,
+        artist: match.artist,
+        album: match.album,
+        releaseDate: match.releaseDate,
+        songLink: match.shazamUrl,
         recognizedAt: DateTime.now(),
         stationName: stationName,
       );
-    } on FormatException {
-      throw RecognitionException('Răspuns invalid de la serviciul de recunoaștere.');
     } finally {
       try {
         await audio.delete();
       } catch (_) {}
     }
   }
+
+  /// Decodează fișierul în PCM mono 16 kHz. WAV se citește direct; MP3/AAC
+  /// se decodează cu MediaCodec pe Android, respectiv ffmpeg pe desktop.
+  static Future<Int16List> decodeToMono16k(File audio, {int maxSeconds = 30}) async {
+    if (p.extension(audio.path).toLowerCase() == '.wav') {
+      final bytes = await audio.readAsBytes();
+      return Isolate.run(() {
+        try {
+          return parseWav(bytes).toMono16k();
+        } on FormatException catch (e) {
+          throw RecognitionException('Înregistrare invalidă: ${e.message}');
+        }
+      });
+    }
+
+    if (Platform.isAndroid) {
+      final Map<Object?, Object?>? res;
+      try {
+        res = await _decoderChannel.invokeMapMethod<Object?, Object?>(
+          'decode',
+          {'path': audio.path, 'maxSeconds': maxSeconds},
+        );
+      } on PlatformException catch (e) {
+        throw RecognitionException('Formatul stream-ului nu poate fi decodat (${e.message}). Încearcă prin microfon.');
+      }
+      final raw = res?['pcm'];
+      if (raw is! Uint8List || raw.isEmpty) {
+        throw RecognitionException('Stream-ul nu a putut fi decodat. Încearcă prin microfon.');
+      }
+      final rate = res!['sampleRate'] as int;
+      final channels = res['channels'] as int;
+      return Isolate.run(() {
+        // Copie aliniată la 2 octeți (vederea primită poate avea alt offset).
+        final samples = Uint8List.fromList(raw.sublist(0, raw.length & ~1)).buffer.asInt16List();
+        return PcmAudio(samples, rate, channels).toMono16k();
+      });
+    }
+
+    return decodeWithFfmpeg(audio.path, maxSeconds: maxSeconds);
+  }
+
+  /// Desktop: decodare prin ffmpeg (dacă e instalat).
+  static Future<Int16List> decodeWithFfmpeg(String path, {int maxSeconds = 30}) async {
+    final ProcessResult result;
+    try {
+      result = await Process.run(
+        'ffmpeg',
+        ['-v', 'error', '-i', path, '-t', '$maxSeconds', '-f', 's16le', '-ac', '1', '-ar', '16000', '-'],
+        stdoutEncoding: null,
+      );
+    } on ProcessException {
+      throw RecognitionException(
+          'Pentru recunoaștere din stream pe acest sistem e nevoie de ffmpeg. Folosește microfonul.');
+    }
+    final out = result.stdout as List<int>;
+    if (result.exitCode != 0 && out.isEmpty) {
+      throw RecognitionException('Stream-ul nu a putut fi decodat (${result.stderr}).');
+    }
+    final bytes = Uint8List.fromList(out);
+    return Int16List.view(bytes.buffer, 0, bytes.length ~/ 2);
+  }
 }
 
+/// Amprenta Shazam pentru (mijlocul) fragmentului, calculată în afara firului UI.
+Future<ShazamSignature> computeSignature(Int16List mono16k) =>
+    Isolate.run(() => ShazamSignatureGenerator.fromPcm(centerSegment(mono16k, seconds: kRecognitionSeconds)));
+
+/// Citește începutul stream-ului: întâi prin clientul HTTP, apoi (pentru
+/// servere SHOUTcast vechi care răspund "ICY 200 OK") direct prin socket.
+Future<Uint8List> captureStreamBytes(String streamUrl, {int maxBytes = 260000}) async {
+  try {
+    return await _captureHttp(streamUrl, CaptureTarget(maxBytes));
+  } on RecognitionException {
+    rethrow;
+  } catch (_) {
+    // Clientul HTTP respinge "ICY 200 OK" ("Invalid response line") — citim direct.
+    return captureRawStream(Uri.parse(streamUrl), maxBytes);
+  }
+}
+
+Future<Uint8List> _captureHttp(String streamUrl, CaptureTarget target) async {
+  final client = http.Client();
+  final bytes = BytesBuilder(copy: false);
+  try {
+    final request = http.Request('GET', Uri.parse(streamUrl))..headers['User-Agent'] = kHttpUserAgent;
+    final response = await client.send(request).timeout(const Duration(seconds: 15));
+    if (response.statusCode != 200) {
+      throw RecognitionException('Stream-ul a răspuns cu HTTP ${response.statusCode}.');
+    }
+    final done = Completer<void>();
+    late StreamSubscription<List<int>> sub;
+    var wanted = target.fallback;
+    var sniffed = false;
+    sub = response.stream.listen(
+      (chunk) {
+        bytes.add(chunk);
+        if (!sniffed && bytes.length >= 16384) {
+          wanted = target.bytesFor(bytes.toBytes());
+          sniffed = true;
+        }
+        if (bytes.length >= wanted && !done.isCompleted) done.complete();
+      },
+      onDone: () => done.isCompleted ? null : done.complete(),
+      onError: (Object e) => done.isCompleted ? null : done.completeError(e),
+      cancelOnError: true,
+    );
+    await done.future.timeout(const Duration(seconds: 25), onTimeout: () {});
+    await sub.cancel();
+  } finally {
+    client.close();
+  }
+  return bytes.takeBytes();
+}
 
 /// Citește stream-ul printr-un socket, acceptând atât "HTTP/1.x 200" cât și
 /// "ICY 200 OK"; urmează redirecționările.
@@ -307,6 +408,9 @@ Future<Uint8List> captureRawStream(Uri uri, int maxBytes, {int redirects = 3}) a
 
   final buffer = BytesBuilder(copy: false);
   final done = Completer<void>();
+  final target = CaptureTarget(maxBytes);
+  var wanted = maxBytes;
+  var sniffed = false;
   int? bodyStart;
   Uri? redirectTo;
   void fail(Object e) => done.isCompleted ? null : done.completeError(e);
@@ -337,7 +441,12 @@ Future<Uint8List> captureRawStream(Uri uri, int maxBytes, {int redirects = 3}) a
         }
         bodyStart = end + 4;
       }
-      if (buffer.length - bodyStart! >= maxBytes && !done.isCompleted) done.complete();
+      final bodyLength = buffer.length - bodyStart!;
+      if (!sniffed && bodyLength >= 16384) {
+        wanted = target.bytesFor(Uint8List.sublistView(buffer.toBytes(), bodyStart!));
+        sniffed = true;
+      }
+      if (bodyLength >= wanted && !done.isCompleted) done.complete();
     },
     onDone: () => done.isCompleted ? null : done.complete(),
     onError: fail,
@@ -350,10 +459,10 @@ Future<Uint8List> captureRawStream(Uri uri, int maxBytes, {int redirects = 3}) a
     socket.destroy();
   }
 
-  final target = redirectTo;
-  if (target != null) {
+  final redirect = redirectTo;
+  if (redirect != null) {
     if (redirects <= 0) throw RecognitionException('Prea multe redirecționări ale stream-ului.');
-    return captureRawStream(target, maxBytes, redirects: redirects - 1);
+    return captureRawStream(redirect, maxBytes, redirects: redirects - 1);
   }
   final start = bodyStart;
   if (start == null) throw RecognitionException('Stream-ul nu a trimis date.');

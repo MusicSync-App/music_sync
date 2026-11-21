@@ -1085,69 +1085,12 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
     return streamAvailable ? _RecognitionSource.stream : _RecognitionSource.microphone;
   }
 
-  Future<String?> _askForToken({bool force = false}) async {
-    final existing = await SongRecognizer.getToken();
-    if (existing != null && !force) return existing;
-    if (!mounted) return null;
-
-    final controller = TextEditingController(text: existing ?? '');
-    final token = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Conectare recunoaștere melodii'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Shazam nu permite conectarea contului tău în alte aplicații (nu are API public). '
-                'Recunoașterea folosește AudD — aceeași tehnologie de amprentă audio.\n\n'
-                'Creează-ți un cont pe dashboard.audd.io, copiază tokenul API și lipește-l mai jos. '
-                'Se cere o singură dată.',
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: controller,
-                autofocus: true,
-                decoration: const InputDecoration(labelText: 'Token API', border: OutlineInputBorder()),
-              ),
-              TextButton.icon(
-                icon: const Icon(Icons.open_in_new, size: 16),
-                label: const Text('Deschide dashboard.audd.io'),
-                onPressed: () => launchUrl(Uri.parse(kRecognitionDashboardUrl), mode: LaunchMode.externalApplication),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          if (existing != null)
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, ''),
-              child: const Text('Deconectează', style: TextStyle(color: Colors.redAccent)),
-            ),
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Anulează')),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
-            child: const Text('Salvează'),
-          ),
-        ],
-      ),
-    );
-    if (token == null) return existing;
-    await SongRecognizer.setToken(token);
-    return token.isEmpty ? null : token;
-  }
-
   Future<void> _recognize() async {
     if (_recState != _RecognitionState.idle) return;
     if (_isOffline) {
       setState(() => _recError = 'Recunoașterea are nevoie de internet.');
       return;
     }
-    final token = await _askForToken();
-    if (token == null || !mounted) return;
-
     final audio = GlobalAudioState.instance;
     final radio = audio.currentRadio;
     final source = _effectiveSource(radio);
@@ -1166,7 +1109,11 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
       if (!mounted) return;
       setState(() => _recState = _RecognitionState.searching);
 
-      final song = await _recognizer.recognize(sample, token: token, stationName: radio?.name);
+      final song = await _recognizer.recognize(
+        sample,
+        stationName: radio?.name,
+        icyTitle: source == _RecognitionSource.stream ? audio.radioNowPlaying : null,
+      );
       if (song == null) {
         if (mounted) setState(() => _lastNotFound = true);
         return;
@@ -1213,8 +1160,6 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
                     _showAddStationDialog();
                   case 'map':
                     _prefetchVisibleArea();
-                  case 'account':
-                    _askForToken(force: true);
                   case 'world':
                     _downloadWorld();
                 }
@@ -1228,10 +1173,6 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
                 PopupMenuItem(
                   value: 'world',
                   child: ListTile(leading: Icon(Icons.public), title: Text('Actualizează posturile lumii')),
-                ),
-                PopupMenuItem(
-                  value: 'account',
-                  child: ListTile(leading: Icon(Icons.key), title: Text('Cont recunoaștere melodii')),
                 ),
               ],
             ),
@@ -1930,7 +1871,6 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
             child: ListTile(
               leading: const Icon(Icons.error_outline, color: Colors.redAccent),
               title: Text(_recError!),
-              trailing: TextButton(onPressed: () => _askForToken(force: true), child: const Text('Token')),
             ),
           ),
         if (_lastNotFound)
@@ -1973,6 +1913,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
       if (song.album.isNotEmpty) song.album,
       if (song.releaseDate.length >= 4) song.releaseDate.substring(0, 4),
       if (song.stationName != null) '📻 ${song.stationName}',
+      if (song.source == 'icy') 'după titlul transmis de post',
       _formatDate(song.recognizedAt),
     ].join(' • ');
 
