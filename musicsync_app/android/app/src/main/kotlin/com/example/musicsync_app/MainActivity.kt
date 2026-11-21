@@ -22,6 +22,7 @@ class MainActivity : AudioServiceActivity() {
         private const val CHANNEL = "musicsync/ytdlp"
         private const val WIFI_LOCK_CHANNEL = "musicsync/wifilock"
         private const val DEVICE_CHANNEL = "musicsync/device"
+        private const val DECODER_CHANNEL = "musicsync/audio_decoder"
 
         // Trebuie să fie identic cu androidNotificationChannelId din main.dart.
         private const val PLAYER_CHANNEL = "com.example.musicsync_app.player"
@@ -111,6 +112,31 @@ class MainActivity : AudioServiceActivity() {
             } else {
                 result.notImplemented()
             }
+        }
+
+        // Recunoașterea melodiilor: fragmentul MP3/AAC din stream -> PCM 16 biți.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            DECODER_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            if (call.method != "decode") {
+                result.notImplemented()
+                return@setMethodCallHandler
+            }
+            val path = call.argument<String>("path")
+            val maxSeconds = call.argument<Int>("maxSeconds") ?: 30
+            if (path.isNullOrBlank()) {
+                result.error("INVALID_ARGS", "path lipsă", null)
+                return@setMethodCallHandler
+            }
+            Thread {
+                try {
+                    val decoded = AudioDecoder.decode(path, maxSeconds)
+                    runOnUiThread { result.success(decoded) }
+                } catch (e: Exception) {
+                    runOnUiThread { result.error("DECODE_ERROR", e.message ?: e.toString(), null) }
+                }
+            }.start()
         }
 
         if (!Python.isStarted()) {
