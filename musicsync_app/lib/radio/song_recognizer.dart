@@ -183,7 +183,14 @@ class SongRecognizer {
     }
     final file = await _tempFile('wav');
     await _recorder.start(
-      const RecordConfig(encoder: AudioEncoder.wav, sampleRate: 16000, numChannels: 1),
+      // audioInterruption.none: don't take audio focus, otherwise Android pauses the radio
+      // (or any music app) and the microphone only hears silence.
+      const RecordConfig(
+        encoder: AudioEncoder.wav,
+        sampleRate: 16000,
+        numChannels: 1,
+        audioInterruption: AudioInterruptionMode.none,
+      ),
       path: file.path,
     );
     await Future.delayed(duration);

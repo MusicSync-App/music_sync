@@ -217,10 +217,13 @@ class _SaveToPlaylistSheetState extends State<_SaveToPlaylistSheet> {
               ),
               const SizedBox(height: 8),
               SegmentedButton<String>(
+                // No icons: in the narrow dialog they forced the labels to wrap mid-word.
+                showSelectedIcon: false,
+                style: const ButtonStyle(visualDensity: VisualDensity.compact),
                 segments: const [
-                  ButtonSegment(value: 'private', icon: Icon(Icons.lock, size: 16), label: Text('Privat')),
-                  ButtonSegment(value: 'unlisted', icon: Icon(Icons.link, size: 16), label: Text('Nelistat')),
-                  ButtonSegment(value: 'public', icon: Icon(Icons.public, size: 16), label: Text('Public')),
+                  ButtonSegment(value: 'private', label: Text('Privat', softWrap: false)),
+                  ButtonSegment(value: 'unlisted', label: Text('Nelistat', softWrap: false)),
+                  ButtonSegment(value: 'public', label: Text('Public', softWrap: false)),
                 ],
                 selected: {privacy},
                 onSelectionChanged: (s) => setDialogState(() => privacy = s.first),
