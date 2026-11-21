@@ -7,7 +7,10 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'disk_cache.dart';
+import 'geo.dart';
+import 'radio_garden.dart';
 import 'radio_station.dart';
+import 'station_bundle.dart';
 
 enum StationSort { nearby, popular, votes, trending }
 
@@ -26,6 +29,37 @@ class CachedStations {
 }
 
 class RadioRepository {
+  /// Catalogul inclus în aplicație (posturi din alte directoare decât Radio
+  /// Browser). Înlocuibil în teste.
+  final Future<StationBundle> Function() _loadBundle;
+
+  /// Rezerva Radio Garden pentru țările din afara catalogului (false în teste).
+  final bool _useRadioGarden;
+
+  RadioRepository({Future<StationBundle> Function()? loadBundle, bool useRadioGarden = true})
+      : _loadBundle = loadBundle ?? StationBundle.load,
+        _useRadioGarden = useRadioGarden;
+
+  RadioGardenClient? _radioGarden;
+
+  Future<RadioGardenClient> _garden() async {
+    final existing = _radioGarden;
+    if (existing != null) return existing;
+    final locator = await CountryLocator.load();
+    return _radioGarden = RadioGardenClient(countryAt: (lat, lon) => locator.lookup(lat, lon)?.code);
+  }
+
+  /// Posturile Radio Garden ale țării, doar dacă nu e acoperită de catalog.
+  /// Erorile sunt ignorate (e doar o completare).
+  Future<List<RadioStation>> _radioGardenFor(String countryCode, StationBundle bundle) async {
+    if (!_useRadioGarden || bundle.covers(countryCode)) return const [];
+    try {
+      return await (await _garden()).fetchCountry(countryCode);
+    } catch (_) {
+      return const [];
+    }
+  }
+
   // Oglinzi publice Radio Browser — încercate pe rând.
   static const List<String> _servers = [
     'de1.api.radio-browser.info',
@@ -106,8 +140,19 @@ class RadioRepository {
   }
 
   /// TOATE posturile unei țări (și cele fără coordonate, ~3/4 din catalog) —
-  /// pentru hartă și listă. Parsarea rulează pe alt isolate.
+  /// pentru hartă și listă: Radio Browser + catalogul inclus + (pentru țările
+  /// din afara catalogului) Radio Garden, fără duplicate. Dacă Radio Browser
+  /// nu răspunde, eroarea se propagă (lista salvată rămâne cea veche).
   Future<List<RadioStation>> fetchCountryAll(String countryCode) async {
+    final bundle = await _loadBundle();
+    final garden = _radioGardenFor(countryCode, bundle);
+    final rb = applyGeoHints(await _fetchRadioBrowserCountryAll(countryCode), bundle.rbGeo);
+    final extra = [...bundle.forCountry(countryCode), ...await garden];
+    if (extra.isEmpty) return rb;
+    return compute(mergeStationLists, (rb, extra));
+  }
+
+  Future<List<RadioStation>> _fetchRadioBrowserCountryAll(String countryCode) async {
     Object? lastError;
     for (final host in _servers) {
       try {
@@ -130,17 +175,25 @@ class RadioRepository {
     throw Exception('Radio Browser indisponibil: $lastError');
   }
 
-  /// Căutare după nume (subșir, fără diferență de majuscule).
+  /// Căutare după nume (subșir, fără diferență de majuscule) — în Radio
+  /// Browser și în catalogul inclus.
   Future<List<RadioStation>> searchByName(String name, {String? countryCode}) async {
-    final raw = await _getJson('/json/stations/search', {
-      'name': name,
-      if (countryCode != null) 'countrycode': countryCode,
-      'hidebroken': 'true',
-      'order': 'clickcount',
-      'reverse': 'true',
-      'limit': '30',
-    });
-    return _parseStations(raw);
+    final local = (await _loadBundle()).search(name, countryCode: countryCode);
+    List<RadioStation> remote;
+    try {
+      remote = _parseStations(await _getJson('/json/stations/search', {
+        'name': name,
+        if (countryCode != null) 'countrycode': countryCode,
+        'hidebroken': 'true',
+        'order': 'clickcount',
+        'reverse': 'true',
+        'limit': '30',
+      }));
+    } catch (_) {
+      if (local.isEmpty) rethrow;
+      remote = const [];
+    }
+    return mergeStations(remote, local);
   }
 
   /// Toate posturile din lume care au coordonate (~13.500, ~17 MB) — ca în
@@ -158,7 +211,8 @@ class RadioRepository {
             .get(uri, headers: {'User-Agent': kHttpUserAgent})
             .timeout(const Duration(minutes: 3));
         if (res.statusCode == 200) {
-          return compute(_decodeWorld, res.bodyBytes);
+          final world = await compute(_decodeWorld, res.bodyBytes);
+          return _withBundle(world);
         }
         lastError = 'HTTP ${res.statusCode}';
       } catch (e) {
@@ -171,18 +225,30 @@ class RadioRepository {
   Future<void> saveWorldCache(List<RadioStation> stations) async {
     final file = _cacheFile('world');
     final tmp = File('${file.path}.tmp');
-    await tmp.writeAsString(await compute(_encodeCache, stations));
+    await tmp.writeAsString(await compute(_encodeCache, _withoutBundle(stations)));
     await tmp.rename(file.path);
   }
 
+  /// Lista mondială salvată + catalogul inclus. Fără listă salvată întoarce
+  /// o listă goală (ecranul oferă atunci descărcarea ei; până atunci
+  /// posturile catalogului apar pe hartă odată cu țara lor).
   Future<CachedStations> loadWorldCache() async {
     final file = _cacheFile('world');
     if (!await file.exists()) return const CachedStations([], null);
     try {
-      return await compute(_decodeCache, await file.readAsString());
+      final cached = await compute(_decodeCache, await file.readAsString());
+      return CachedStations(await _withBundle(cached.stations), cached.fetchedAt);
     } catch (_) {
       return const CachedStations([], null);
     }
+  }
+
+  /// [stations] + toate posturile catalogului (cu poziție), fără duplicate.
+  Future<List<RadioStation>> _withBundle(List<RadioStation> stations) async {
+    final bundle = await _loadBundle();
+    final extra = bundle.all.where((s) => s.hasLocation).toList();
+    if (extra.isEmpty) return stations;
+    return compute(mergeStationLists, (stations, extra));
   }
 
   List<RadioStation> _parseStations(List<dynamic> raw) {
@@ -198,7 +264,7 @@ class RadioRepository {
   /// Etichetă Radio Browser: anunță că postul a fost pornit (contează la
   /// clasamentul de popularitate). Erorile sunt ignorate.
   Future<void> reportClick(RadioStation station) async {
-    if (station.isManual) return;
+    if (!isRadioBrowserStation(station)) return;
     try {
       await _getJson('/json/url/${station.uuid}', {});
     } catch (_) {}
@@ -211,24 +277,37 @@ class RadioRepository {
   static String cacheKeyFor(String? countryCode) =>
       (countryCode == null || countryCode.isEmpty) ? 'nearby' : countryCode.toUpperCase();
 
+  /// Posturile catalogului nu se salvează (sunt deja în aplicație, iar o
+  /// versiune nouă a catalogului le înlocuiește).
   Future<void> saveCache(String key, List<RadioStation> stations) async {
     final file = _cacheFile(key);
     final tmp = File('${file.path}.tmp');
-    await tmp.writeAsString(await compute(_encodeCache, stations));
+    await tmp.writeAsString(await compute(_encodeCache, _withoutBundle(stations)));
     await tmp.rename(file.path);
   }
 
+  /// Lista salvată. Pentru listele de țară (`all_XX`) se adaugă și posturile
+  /// din catalogul inclus — țara are posturi chiar înainte de prima
+  /// descărcare (atunci `fetchedAt` e null, deci se actualizează la prima ocazie).
   Future<CachedStations> loadCache(String key) async {
     final file = _cacheFile(key);
-    if (!await file.exists()) return const CachedStations([], null);
-    try {
-      return await compute(_decodeCache, await file.readAsString());
-    } catch (_) {
-      return const CachedStations([], null);
+    var cached = const CachedStations([], null);
+    if (await file.exists()) {
+      try {
+        cached = await compute(_decodeCache, await file.readAsString());
+      } catch (_) {}
     }
+    if (!key.startsWith(_kCountryAllPrefix)) return cached;
+    final bundle = await _loadBundle();
+    final stations = applyGeoHints(cached.stations, bundle.rbGeo);
+    final extra = bundle.forCountry(key.substring(_kCountryAllPrefix.length));
+    if (extra.isEmpty) return CachedStations(stations, cached.fetchedAt);
+    return CachedStations(await compute(mergeStationLists, (stations, extra)), cached.fetchedAt);
   }
 
-  static String countryAllKey(String countryCode) => 'all_${countryCode.toUpperCase()}';
+  static const String _kCountryAllPrefix = 'all_';
+
+  static String countryAllKey(String countryCode) => '$_kCountryAllPrefix${countryCode.toUpperCase()}';
 
   // ── Posturi adăugate manual ───────────────────────────────────────────────
 
@@ -299,6 +378,9 @@ class RadioRepository {
 }
 
 // Funcții top-level (rulează și pe alt isolate prin compute()).
+
+List<RadioStation> _withoutBundle(List<RadioStation> stations) =>
+    stations.where((s) => !s.uuid.startsWith(kBundleUuidPrefix)).toList();
 
 List<RadioStation> _decodeAll(Uint8List bytes) {
   final raw = jsonDecode(utf8.decode(bytes)) as List;
