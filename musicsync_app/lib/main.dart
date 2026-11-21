@@ -30,10 +30,13 @@ import 'background_jobs.dart';
 import 'themes/country_detector.dart';
 import 'themes/theme_photos.dart';
 import 'themes/theme_photos_screen.dart';
+import 'themes/user_themes.dart';
+import 'themes/add_country_theme_screen.dart';
 import 'radio/disk_cache.dart';
 import 'radio/radio_screen.dart';
 import 'radio/radio_station.dart';
 import 'radio/radio_favorites.dart';
+import 'youtube/playlist_save_logic.dart' show PlaylistTarget, encodeTargets, kDownloaderPlaylistsCacheKey;
 
 // ==========================================
 // ENUMERATIONS
@@ -103,6 +106,15 @@ class LocalPlaylistModel {
 class GoogleAuthManager {
   static GoogleSignIn? _instance;
 
+  /// `youtube` (scriere) e necesar pentru "Salvează în playlist" (adăugare în
+  /// playlist / playlist nou). Conturile conectate înainte doar cu
+  /// `youtube.readonly` sunt rugate o singură dată să permită accesul nou.
+  static const List<String> scopes = [
+    youtube.YouTubeApi.youtubeReadonlyScope,
+    youtube.YouTubeApi.youtubeScope,
+    'https://www.googleapis.com/auth/userinfo.email',
+  ];
+
   static GoogleSignIn get instance {
     if (_instance == null) {
       const String webClientId = '1088119046091-88mnpgv9gbj9991uuhiqi1iidl3pbu2i.apps.googleusercontent.com';
@@ -112,10 +124,7 @@ class GoogleAuthManager {
         _instance = GoogleSignIn(
           params: const GoogleSignInParams(
             clientId: webClientId,
-            scopes: [
-              youtube.YouTubeApi.youtubeReadonlyScope,
-              'https://www.googleapis.com/auth/userinfo.email',
-            ],
+            scopes: scopes,
           ),
         );
       } else if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
@@ -123,20 +132,14 @@ class GoogleAuthManager {
           params: const GoogleSignInParams(
             clientId: desktopClientId,
             clientSecret: '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',
-            scopes: [
-              youtube.YouTubeApi.youtubeReadonlyScope,
-              'https://www.googleapis.com/auth/userinfo.email',
-            ],
+            scopes: scopes,
           ),
         );
       } else {
         _instance = GoogleSignIn(
           params: const GoogleSignInParams(
             clientId: webClientId,
-            scopes: [
-              youtube.YouTubeApi.youtubeReadonlyScope,
-              'https://www.googleapis.com/auth/userinfo.email',
-            ],
+            scopes: scopes,
           ),
         );
       }
@@ -150,11 +153,19 @@ class GoogleAuthManager {
       AccessCredentials(
         AccessToken('Bearer', credentials.accessToken, DateTime.now().toUtc().add(const Duration(hours: 1))),
         null,
-        [youtube.YouTubeApi.youtubeReadonlyScope, 'https://www.googleapis.com/auth/userinfo.email'],
+        scopes,
       ),
     );
     return youtube.YouTubeApi(authClient);
   }
+
+  /// Ultimele credențiale obținute (din Downloader & Sync sau din
+  /// "Salvează în playlist") — refolosite fără o nouă autentificare.
+  static GoogleSignInCredentials? lastCredentials;
+
+  /// Crește când lista de playlisturi s-a schimbat în altă parte (ex. un
+  /// playlist creat din Radio) — Downloader & Sync o reîncarcă.
+  static final ValueNotifier<int> playlistsChanged = ValueNotifier(0);
 }
 
 // ==========================================
@@ -694,6 +705,7 @@ void main() async {
   await DiskCache.init();
   JobForegroundService.init();
   await ThemePhotos.instance.init();
+  await UserThemes.instance.load(); // țările adăugate din "Alege tema"
   await RadioFavorites.instance.load();
   LibraryEvents.onPlaylistChanged = GlobalAudioState.instance.refreshPlaylistFromDisk;
   LibraryEvents.onPlaylistRemoved = (title) async {
@@ -802,6 +814,57 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
     super.dispose();
   }
 
+  /// "Adaugă țară": tema nouă devine activă imediat.
+  Future<void> _openAddCountry(BuildContext sheetContext, {UserThemeSpec? existing}) async {
+    final themeProvider = Provider.of<ThemeProvider>(context, listen: false);
+    final id = await Navigator.push<String>(
+      sheetContext,
+      MaterialPageRoute(builder: (_) => AddCountryThemeScreen(existing: existing)),
+    );
+    if (id != null) themeProvider.switchTheme(id);
+  }
+
+  Future<void> _showUserThemeActions(BuildContext sheetContext, UserThemeSpec spec) async {
+    final action = await showModalBottomSheet<String>(
+      context: sheetContext,
+      builder: (c) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(title: Text('${spec.emoji} ${spec.name}', style: const TextStyle(fontWeight: FontWeight.bold))),
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Editează (culoare, cuvinte, poze)'),
+              onTap: () => Navigator.pop(c, 'edit'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete, color: Colors.redAccent),
+              title: const Text('Șterge țara'),
+              onTap: () => Navigator.pop(c, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!sheetContext.mounted) return;
+    if (action == 'edit') {
+      await _openAddCountry(sheetContext, existing: spec);
+    } else if (action == 'delete') {
+      final ok = await showDialog<bool>(
+        context: sheetContext,
+        builder: (d) => AlertDialog(
+          title: Text('Ștergi ${spec.name}?'),
+          content: const Text('Tema și pozele ei adăugate vor fi șterse. Playlisturile care o foloseau revin la detecția automată.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('Anulează')),
+            ElevatedButton(onPressed: () => Navigator.pop(d, true), child: const Text('Șterge')),
+          ],
+        ),
+      );
+      if (ok == true) await UserThemes.instance.remove(spec.id);
+    }
+  }
+
   void _showThemePicker() {
     showModalBottomSheet(
       context: context,
@@ -810,7 +873,7 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
       builder: (ctx) {
         final themeProvider = Provider.of<ThemeProvider>(ctx, listen: false);
 
-        final themes = [
+        final builtInThemes = [
           ('grecia', 'Grecia', '🇬🇷', const Color(0xFF1A5FA8), const Color(0xFFF4EED8)),
           ('armenia', 'Armenia', '🇦🇲', const Color(0xFFC8241A), const Color(0xFF1A100A)),
           ('iran', 'Iran', '🇮🇷', const Color(0xFFD4890A), const Color(0xFF1A0F00)),
@@ -836,7 +899,19 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                   const SizedBox(height: 8),
                   Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2))),
                   const SizedBox(height: 16),
-                  const Text('Alege Tema', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  Row(
+                    children: [
+                      const SizedBox(width: 48),
+                      const Expanded(
+                        child: Text('Alege Tema', textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.add_location_alt, color: Colors.white),
+                        tooltip: 'Adaugă țară',
+                        onPressed: () => _openAddCountry(ctx),
+                      ),
+                    ],
+                  ),
                   Consumer<ThemeProvider>(
                     builder: (context, provider, _) => SwitchListTile(
                       contentPadding: const EdgeInsets.symmetric(horizontal: 20),
@@ -852,13 +927,37 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                   const SizedBox(height: 8),
                   Expanded(
                     child: AnimatedBuilder(
-                      animation: ThemePhotos.instance,
-                      builder: (context, _) => ListView.builder(
+                      animation: Listenable.merge([ThemePhotos.instance, UserThemes.instance]),
+                      builder: (context, _) {
+                      // Temele incluse + țările adăugate de utilizator.
+                      final themes = [
+                        ...builtInThemes,
+                        for (final spec in UserThemes.instance.specs)
+                          if (appThemes[spec.id] != null)
+                            (spec.id, spec.name, spec.emoji, spec.accentColor, appThemes[spec.id]!.scaffoldBackground),
+                      ];
+                      return ListView.builder(
                       controller: controller,
                       padding: const EdgeInsets.symmetric(horizontal: 16),
-                      itemCount: themes.length,
+                      itemCount: themes.length + 1,
                       itemBuilder: (context, i) {
+                        if (i == themes.length) {
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            child: OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                side: const BorderSide(color: Colors.white24),
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                              ),
+                              icon: const Icon(Icons.add_location_alt),
+                              label: const Text('Adaugă țară'),
+                              onPressed: () => _openAddCountry(ctx),
+                            ),
+                          );
+                        }
                         final t = themes[i];
+                        final userSpec = UserThemes.instance.specFor(t.$1);
                         final id = t.$1; final name = t.$2; final emoji = t.$3;
                         final accent = t.$4; final bg = t.$5;
                         final photos = ThemePhotos.instance.photosFor(appThemes[id]!).take(7).toList();
@@ -916,6 +1015,15 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                                             MaterialPageRoute(builder: (_) => ThemePhotosScreen(theme: appThemes[id]!)),
                                           ),
                                         ),
+                                        if (userSpec != null) ...[
+                                          const SizedBox(width: 4),
+                                          IconButton.filled(
+                                            style: IconButton.styleFrom(backgroundColor: Colors.black54),
+                                            icon: const Icon(Icons.more_vert, color: Colors.white, size: 20),
+                                            tooltip: 'Editează / șterge $name',
+                                            onPressed: () => _showUserThemeActions(ctx, userSpec),
+                                          ),
+                                        ],
                                       ],
                                     ),
                                   ),
@@ -925,7 +1033,8 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                           ),
                         );
                       },
-                    ),
+                    );
+                    },
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -2243,6 +2352,7 @@ class _MusicSyncHomePageState extends State<MusicSyncHomePage> {
   void initState() {
     super.initState();
     _job.addListener(_onJobChanged);
+    GoogleAuthManager.playlistsChanged.addListener(_onPlaylistsChangedElsewhere);
     _loadSavedFolder();
     _autoRestoreLogin();
   }
@@ -2277,11 +2387,20 @@ class _MusicSyncHomePageState extends State<MusicSyncHomePage> {
   void dispose() {
     // NU oprim descărcarea — continuă în fundal.
     _job.removeListener(_onJobChanged);
+    GoogleAuthManager.playlistsChanged.removeListener(_onPlaylistsChangedElsewhere);
     _logScrollController.dispose();
     super.dispose();
   }
 
   void _addLog(String message) => _job.addLog(message);
+
+  /// Un playlist a fost creat din "Salvează în playlist" (Radio) — îl arătăm.
+  void _onPlaylistsChangedElsewhere() {
+    if (!mounted) return;
+    final creds = GoogleAuthManager.lastCredentials;
+    if (creds != null) _credentials = creds;
+    if (_credentials != null) _fetchPlaylists();
+  }
 
   void _showErrorDialog(String title, dynamic error) {
     showDialog(
@@ -2326,6 +2445,7 @@ class _MusicSyncHomePageState extends State<MusicSyncHomePage> {
     try {
       final creds = await _googleSignIn.signIn();
       if (creds != null) {
+        GoogleAuthManager.lastCredentials = creds;
         setState(() => _credentials = creds);
         if (creds.accessToken != null) await _fetchAndSaveUserEmail(creds.accessToken!);
         await _fetchPlaylists();
@@ -2340,8 +2460,10 @@ class _MusicSyncHomePageState extends State<MusicSyncHomePage> {
   Future<void> _handleSignOut() async {
     try {
       await _googleSignIn.signOut();
+      GoogleAuthManager.lastCredentials = null;
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove('user_logged_email');
+      await prefs.remove(kDownloaderPlaylistsCacheKey);
 
       setState(() {
         _credentials = null;
@@ -2391,6 +2513,21 @@ class _MusicSyncHomePageState extends State<MusicSyncHomePage> {
           if (loadedCustom != null) fetched.insert(0, loadedCustom);
         }
       }
+
+      final mineIds = (response.items ?? const <youtube.Playlist>[]).map((p) => p.id).toSet();
+      await prefs.setString(
+        kDownloaderPlaylistsCacheKey,
+        encodeTargets([
+          for (final p in fetched)
+            if (p.id != null)
+              PlaylistTarget(
+                id: p.id!,
+                title: p.snippet?.title ?? p.id!,
+                itemCount: p.contentDetails?.itemCount ?? 0,
+                owned: mineIds.contains(p.id),
+              ),
+        ]),
+      );
 
       setState(() => _playlists = fetched);
       _addLog('S-au încărcat ${_playlists.length} playlist-uri.');

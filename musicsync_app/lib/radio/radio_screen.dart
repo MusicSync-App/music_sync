@@ -16,10 +16,13 @@ import 'package:url_launcher/url_launcher.dart';
 import '../main.dart' show GlobalAudioState, PersistentBottomMiniPlayer;
 import 'disk_cache.dart';
 import 'geo.dart';
+import 'location_prompt_policy.dart';
 import 'place_locator.dart';
 import 'radio_favorites.dart';
 import 'radio_repository.dart';
 import 'radio_station.dart';
+import 'save_to_playlist_sheet.dart';
+import '../youtube/playlist_save_logic.dart' show SongQuery, parseNowPlaying;
 import 'song_recognizer.dart';
 import 'station_clusters.dart';
 import 'stream_finder.dart';
@@ -78,7 +81,9 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
   /// și cerem pornirea, în loc să afișăm în tăcere o poziție veche.
   bool _locationServiceOff = false;
   bool _permissionDenied = false;
-  bool _askedToEnableLocation = false;
+  bool _locationDialogOpen = false;
+  LocationPromptMemory? _locationMemory;
+  AppLifecycleListener? _lifecycleListener;
   StreamSubscription<ServiceStatus>? _serviceStatusSub;
 
   // Posturi (lista: țara mea sau țara aleasă)
@@ -137,6 +142,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
     super.initState();
     _focusPending = widget.focusPlaying;
     RadioScreen.focusPlayingRequests.addListener(_onFocusRequest);
+    _lifecycleListener = AppLifecycleListener(onResume: _onAppResumed);
     _init();
   }
 
@@ -181,6 +187,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
     _tabs.dispose();
     _connectivitySub?.cancel();
     _serviceStatusSub?.cancel();
+    _lifecycleListener?.dispose();
     _reclusterTimer?.cancel();
     _countryLoadTimer?.cancel();
     _prefetchCancelled = true;
@@ -217,7 +224,9 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
     _rebuildMapStations();
 
     unawaited(_maybeAutoDownloadWorld());
-    await _locate();
+    // Fără să așteptăm fix-ul GPS (până la 25 s): ultima poziție cunoscută
+    // ajunge imediat, iar cea nouă se actualizează în fundal.
+    await _locate(waitForFix: false);
     // Fără GPS și fără o poziție salvată (ex. după reinstalare) lista rămânea
     // goală: pornim pe țara rețelei mobile (merge și fără GPS/internet),
     // apoi pe cea din setările telefonului, altfel pe Grecia.
@@ -391,6 +400,19 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
     }
   }
 
+  /// Revenit în aplicație (ex. din Setări) — reverificăm în tăcere, fără
+  /// să cerem nimic, dacă locația era blocată.
+  void _onAppResumed() {
+    if (!mounted || _locating) return;
+    if (_permissionDenied || _locationServiceOff) _locate();
+  }
+
+  static LocationPermissionStatus _permissionStatus(LocationPermission p) => switch (p) {
+        LocationPermission.always || LocationPermission.whileInUse => LocationPermissionStatus.granted,
+        LocationPermission.deniedForever => LocationPermissionStatus.deniedForever,
+        _ => LocationPermissionStatus.denied,
+      };
+
   /// Când utilizatorul pornește/oprește locația din telefon, reacționăm imediat.
   void _watchLocationService() {
     try {
@@ -409,8 +431,8 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
   }
 
   Future<void> _promptEnableLocation({required bool permission}) async {
-    if (_askedToEnableLocation || !mounted) return;
-    _askedToEnableLocation = true;
+    if (_locationDialogOpen || !mounted) return;
+    _locationDialogOpen = true;
     final open = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -433,46 +455,85 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
         ],
       ),
     );
+    _locationDialogOpen = false;
     if (open == true) {
       permission ? await Geolocator.openAppSettings() : await Geolocator.openLocationSettings();
     }
   }
 
-  Future<void> _locate() async {
+  /// Află poziția. Automat (la deschidere / revenire) NU întreabă din nou
+  /// dacă utilizatorul a răspuns deja o dată — vezi location_prompt_policy.
+  /// [userInitiated] = a apăsat un buton de locație -> avem voie să întrebăm.
+  /// [waitForFix] = false: întoarce imediat după ultima poziție cunoscută, iar
+  /// fix-ul GPS nou se actualizează în fundal.
+  Future<void> _locate({bool userInitiated = false, bool waitForFix = true}) async {
+    if (!mounted) return;
     setState(() {
       _locating = true;
       _locationError = null;
     });
+    var fixStarted = false;
     try {
+      final memory = _locationMemory ??= await LocationPromptMemory.load();
       if (!await Geolocator.isLocationServiceEnabled()) {
+        if (!mounted) return;
         setState(() {
           _locationServiceOff = true;
           _hasLiveFix = false;
         });
-        unawaited(_promptEnableLocation(permission: false));
+        if (shouldAutoPromptServiceOff(alreadyShown: memory.servicePromptShown, userInitiated: userInitiated)) {
+          unawaited(memory.markServicePromptShown());
+          unawaited(_promptEnableLocation(permission: false));
+        }
         throw 'Locația telefonului este oprită.';
       }
-      var permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
+
+      var status = _permissionStatus(await Geolocator.checkPermission());
+      final action = decideLocationAction(
+        status: status,
+        alreadyAsked: memory.permissionAsked,
+        userInitiated: userInitiated,
+      );
+      if (action == LocationAction.requestPermission) {
+        await memory.markPermissionAsked();
+        status = _permissionStatus(await Geolocator.requestPermission());
+        await memory.rememberChoice(status);
+      } else if (action == LocationAction.openAppSettings) {
+        unawaited(_promptEnableLocation(permission: true));
       }
-      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+      if (!mounted) return;
+      if (status != LocationPermissionStatus.granted) {
         setState(() {
           _permissionDenied = true;
           _hasLiveFix = false;
         });
-        unawaited(_promptEnableLocation(permission: true));
         throw 'Permisiunea de locație a fost refuzată.';
       }
+      if (memory.lastChoice != 'granted') unawaited(memory.rememberChoice(status));
       setState(() {
         _locationServiceOff = false;
         _permissionDenied = false;
       });
 
-      final lastKnown = await Geolocator.getLastKnownPosition();
-      if (lastKnown != null) _setPosition(lastKnown.latitude, lastKnown.longitude, live: false);
+      // Imediat: ultima poziție a telefonului (instant, fără GPS).
+      try {
+        final lastKnown = await Geolocator.getLastKnownPosition();
+        if (lastKnown != null) _setPosition(lastKnown.latitude, lastKnown.longitude, live: false);
+      } catch (_) {}
 
-      // GPS-ul funcționează și fără internet.
+      fixStarted = true;
+      final fix = _refreshLiveFix();
+      if (waitForFix) await fix;
+    } catch (e) {
+      if (mounted) setState(() => _locationError = e.toString());
+    } finally {
+      if (mounted && !fixStarted) setState(() => _locating = false);
+    }
+  }
+
+  /// Fix GPS nou (merge și fără internet); oprește indicatorul la final.
+  Future<void> _refreshLiveFix() async {
+    try {
       final pos = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.medium,
@@ -484,7 +545,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
       await _repo.saveLastPosition(pos.latitude, pos.longitude);
 
       // Altă țară decât cea afișată -> lista noii țări.
-      if (_country?.code != countryBefore && _browseCountry == null) {
+      if (mounted && _country?.code != countryBefore && _browseCountry == null) {
         await _refreshStations(fetch: !_isOffline);
       }
     } on TimeoutException {
@@ -502,8 +563,8 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
   /// una nouă; spune mereu ce se întâmplă.
   Future<void> _goToMyLocation() async {
     if (_locationServiceOff || _permissionDenied) {
-      _askedToEnableLocation = false;
-      await _promptEnableLocation(permission: _permissionDenied);
+      // Cerut explicit de utilizator -> avem voie să întrebăm.
+      await _locate(userInitiated: true);
       return;
     }
     if (_lat != null && _mapReady) {
@@ -514,7 +575,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
       return;
     }
     if (_lat == null) _showSnack('Se caută poziția GPS...');
-    await _locate();
+    await _locate(userInitiated: true);
     if (!mounted) return;
     if (_lat != null && _mapReady) {
       _mapController.move(LatLng(_lat!, _lon!), max(_mapController.camera.zoom, 10));
@@ -1329,7 +1390,9 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
                 style: FilledButton.styleFrom(backgroundColor: Colors.orange, foregroundColor: Colors.black),
                 icon: const Icon(Icons.location_on, size: 18),
                 label: const Text('Pornește'),
-                onPressed: _permissionDenied ? Geolocator.openAppSettings : Geolocator.openLocationSettings,
+                // Permisiune: întrebăm doar acum, la apăsare (sau trimitem în
+                // setări dacă e refuzată definitiv).
+                onPressed: _permissionDenied ? () => _locate(userInitiated: true) : Geolocator.openLocationSettings,
               )
             else
               IconButton(
@@ -1337,7 +1400,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
                     ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.my_location),
                 tooltip: 'Actualizează poziția',
-                onPressed: _locating ? null : _locate,
+                onPressed: _locating ? null : () => _locate(userInitiated: true),
               ),
           ],
         ),
@@ -1796,6 +1859,10 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
               leading: const Icon(Icons.podcasts),
               title: Text(audio.radioNowPlaying!),
               subtitle: Text('Transmis acum de ${radio.name}'),
+              trailing: SaveToPlaylistButton(
+                compact: true,
+                song: parseNowPlaying(audio.radioNowPlaying, stationName: radio.name),
+              ),
             ),
           ),
         const SizedBox(height: 12),
@@ -1942,6 +2009,7 @@ class _RadioScreenState extends State<RadioScreen> with SingleTickerProviderStat
                   label: const Text('YouTube'),
                   onPressed: () => _openUrl(song.youtubeSearchUrl),
                 ),
+                SaveToPlaylistButton(song: SongQuery(artist: song.artist, title: song.title)),
               ],
             ),
           ],

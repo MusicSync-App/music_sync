@@ -100,6 +100,14 @@ class ThemePhotos extends ChangeNotifier {
     return added;
   }
 
+  /// Șterge toate pozele adăugate ale unei teme (ex. țară ștearsă).
+  Future<void> removeAllUserPhotos(CountryTheme theme) async {
+    if (_userRoot == null) return;
+    final dir = _userDir(theme);
+    if (await dir.exists()) await dir.delete(recursive: true);
+    notifyListeners();
+  }
+
   Future<void> removeUserPhoto(File file) async {
     if (await file.exists()) await file.delete();
     notifyListeners();
