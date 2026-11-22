@@ -1,0 +1,29 @@
+# Render Blueprint for the MusicSync update + community-themes server.
+# See musicsync_app/server/README.md for setup (env vars, GitHub token permissions).
+services:
+  - type: web
+    name: musicsync-server
+    runtime: python
+    plan: free
+    rootDir: musicsync_app/server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      # Fine-grained PAT (see README). Never commit it.
+      - key: GITHUB_TOKEN
+        sync: false
+      # "<owner>/<repo>" — set in the Render dashboard (the GitHub owner/org is not fixed here).
+      - key: CONTENT_REPO   # e.g. <org>/musicsync-content (public)
+        sync: false
+      - key: PENDING_REPO   # e.g. <org>/musicsync-pending (private)
+        sync: false
+      - key: APP_REPO       # e.g. <org>/music_sync (releases with app-release.apk + version.json)
+        sync: false
+      - key: ADMIN_EMAILS   # comma separated, e.g. eric.ratiu@gmail.com
+        sync: false
+      - key: MAX_SUBMISSIONS_PER_DAY
+        value: "5"
