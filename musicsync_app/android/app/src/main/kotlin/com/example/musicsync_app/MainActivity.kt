@@ -134,8 +134,12 @@ class MainActivity : AudioServiceActivity() {
                         val uri = androidx.core.content.FileProvider.getUriForFile(
                             this, "$packageName.updates", file
                         )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                        // ACTION_INSTALL_PACKAGE merge direct la instalatorul de sistem
+                        // (ACTION_VIEW arăta un „Deschide cu” cu alte aplicații care acceptă APK).
+                        @Suppress("DEPRECATION")
+                        val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
                             setDataAndType(uri, "application/vnd.android.package-archive")
+                            putExtra(Intent.EXTRA_RETURN_RESULT, false)
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
