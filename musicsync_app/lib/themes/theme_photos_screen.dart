@@ -1,6 +1,7 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import '../remote/publish_ui.dart';
 import 'app_themes.dart';
 import 'theme_photos.dart';
 
@@ -42,7 +43,17 @@ class ThemePhotosScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('Poze — ${theme.name}')),
+      appBar: AppBar(
+        title: Text('Poze — ${theme.name}'),
+        actions: [
+          if (canPublishPhotosFor(theme))
+            IconButton(
+              icon: const Icon(Icons.public),
+              tooltip: 'Publică pozele mele pentru toți',
+              onPressed: () => publishThemePhotos(context, theme),
+            ),
+        ],
+      ),
       floatingActionButton: FloatingActionButton.extended(
         icon: const Icon(Icons.add_photo_alternate),
         label: const Text('Adaugă poze'),
@@ -86,7 +97,7 @@ class ThemePhotosScreen extends StatelessWidget {
                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
                         child: Text(
-                          photo.isUserPhoto ? 'adăugată' : 'inclusă',
+                          photo.isShared ? '🌍 comunitate' : (photo.isUserPhoto ? 'adăugată' : 'inclusă'),
                           style: const TextStyle(color: Colors.white, fontSize: 11),
                         ),
                       ),

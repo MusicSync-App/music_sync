@@ -9,6 +9,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.telephony.TelephonyManager
@@ -23,6 +24,7 @@ class MainActivity : AudioServiceActivity() {
         private const val WIFI_LOCK_CHANNEL = "musicsync/wifilock"
         private const val DEVICE_CHANNEL = "musicsync/device"
         private const val DECODER_CHANNEL = "musicsync/audio_decoder"
+        private const val INSTALLER_CHANNEL = "musicsync/installer"
 
         // Trebuie să fie identic cu androidNotificationChannelId din main.dart.
         private const val PLAYER_CHANNEL = "com.example.musicsync_app.player"
@@ -111,6 +113,39 @@ class MainActivity : AudioServiceActivity() {
                 result.success(iso?.uppercase())
             } else {
                 result.notImplemented()
+            }
+        }
+
+        // Actualizări: pornește instalatorul sistemului pentru APK-ul descărcat
+        // (content:// prin UpdateFileProvider — merge pe Android 7..14+).
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            INSTALLER_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "installApk" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "path lipsă", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val file = java.io.File(path)
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            this, "$packageName.updates", file
+                        )
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "application/vnd.android.package-archive")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("INSTALL_ERROR", e.message ?: e.toString(), null)
+                    }
+                }
+                else -> result.notImplemented()
             }
         }
 

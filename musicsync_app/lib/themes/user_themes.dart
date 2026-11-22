@@ -99,20 +99,28 @@ Color _hsl(double hue, double sat, double light) =>
 
 /// Tema completă derivată dintr-o singură culoare (fundal închis în nuanța
 /// culorii, card puțin mai deschis, text aproape alb, culori de player).
-CountryTheme buildUserTheme(UserThemeSpec spec) {
-  final accent = spec.accentColor;
+CountryTheme buildUserTheme(UserThemeSpec spec) =>
+    buildColorTheme(id: spec.id, name: spec.name, accent: spec.accentColor, photoFolder: spec.photoFolder);
+
+/// La fel, pentru orice temă definită doar printr-o culoare (ex. temele comune).
+CountryTheme buildColorTheme({
+  required String id,
+  required String name,
+  required Color accent,
+  required String photoFolder,
+}) {
   final hsl = HSLColor.fromColor(accent);
   final h = hsl.hue;
   final s = hsl.saturation;
 
   return CountryTheme(
-    id: spec.id,
-    name: spec.name,
+    id: id,
+    name: name,
     scaffoldBackground: _hsl(h, s * 0.45, 0.07),
     cardBackground: _hsl(h, s * 0.4, 0.13),
     textColor: _hsl(h, 0.25, 0.93),
     accentColor: accent,
-    photoFolder: spec.photoFolder,
+    photoFolder: photoFolder,
     playerMoods: {
       SongMood.chill: PlayerColors(
         gradientColors: [_hsl(h - 30, s * 0.5, 0.16), _hsl(h - 30, s * 0.55, 0.28)],
