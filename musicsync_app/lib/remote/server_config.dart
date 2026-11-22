@@ -2,7 +2,7 @@
 /// Singurul loc unde se schimbă adresa serverului.
 library;
 
-const String kServerBaseUrl = 'https://musicsync-server.onrender.com';
+const String kServerBaseUrl = 'https://musicsync-server-9zf9.onrender.com';
 
 /// Repo-ul GitHub cu release-urile aplicației (APK + version.json).
 const String kAppRepo = 'MusicSync-App/music_sync';
