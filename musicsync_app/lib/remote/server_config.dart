@@ -5,7 +5,7 @@ library;
 const String kServerBaseUrl = 'https://musicsync-server.onrender.com';
 
 /// Repo-ul GitHub cu release-urile aplicației (APK + version.json).
-const String kAppRepo = 'JustEricGR/music_sync';
+const String kAppRepo = 'MusicSync-App/music_sync';
 
 /// Rezervă când serverul nu răspunde: version.json din ultimul release.
 const String kFallbackVersionJsonUrl = 'https://github.com/$kAppRepo/releases/latest/download/version.json';
