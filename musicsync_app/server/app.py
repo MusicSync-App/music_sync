@@ -6,6 +6,7 @@ Contract: see README.md. All persistent state lives in GitHub repos (Render's di
 
 from __future__ import annotations
 
+import re
 import asyncio
 import copy
 import hashlib
@@ -268,7 +269,13 @@ def create_app(
     @app.exception_handler(StorageError)
     async def _storage_error(_req, exc: StorageError):
         log.error("storage error: %s", exc)
-        return err(502, "storage_unavailable", "Serverul de stocare nu răspunde. Încearcă din nou mai târziu.")
+        body = {"error": "storage_unavailable",
+                "message": "Serverul de stocare nu răspunde. Încearcă din nou mai târziu."}
+        # Diagnostic: GitHub method/path/status only (never headers or the token).
+        m = re.search(r"GitHub (\w+) (\S+) -> (\d{3})", str(exc))
+        if m:
+            body["detail"] = f"github {m.group(1)} {m.group(2)} -> {m.group(3)}"
+        return JSONResponse(body, status_code=502)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_req, exc: StarletteHTTPException):
