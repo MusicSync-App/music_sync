@@ -4,6 +4,7 @@ import 'app_themes.dart';
 import 'theme_photos.dart';
 import 'country_detector.dart' show kDefaultThemeId;
 import 'user_themes.dart';
+import '../remote/shared_themes.dart';
 import 'dart:math';
 
 const String _kAutoThemePrefsKey = 'auto_theme_enabled';
@@ -25,10 +26,12 @@ class ThemeProvider extends ChangeNotifier {
     _pickRandomImage();
     _loadAutoThemePref();
     UserThemes.instance.addListener(_onUserThemesChanged);
+    SharedThemes.instance.addListener(_onUserThemesChanged); // teme comune sincronizate
   }
 
-  /// O țară adăugată a fost ștearsă (sau modificată) — dacă era activă,
-  /// revenim la Grecia / reconstruim tema cu culorile noi.
+  /// O țară adăugată (sau comună) a fost ștearsă / modificată — dacă era
+  /// activă, revenim la Grecia / reconstruim tema cu culorile noi. Pozele
+  /// comune noi ale temei active pot deveni fundal.
   void _onUserThemesChanged() {
     final latest = appThemes[_currentTheme.id];
     if (latest == null) {
@@ -37,12 +40,16 @@ class ThemeProvider extends ChangeNotifier {
       _currentTheme = latest;
       _pickRandomImage();
       notifyListeners();
+    } else if (_currentBackground == null || !ThemePhotos.instance.photosFor(_currentTheme).contains(_currentBackground)) {
+      _pickRandomImage();
+      notifyListeners();
     }
   }
 
   @override
   void dispose() {
     UserThemes.instance.removeListener(_onUserThemesChanged);
+    SharedThemes.instance.removeListener(_onUserThemesChanged);
     super.dispose();
   }
 

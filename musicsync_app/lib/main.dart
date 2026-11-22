@@ -36,6 +36,12 @@ import 'radio/disk_cache.dart';
 import 'radio/radio_screen.dart';
 import 'radio/radio_station.dart';
 import 'radio/radio_favorites.dart';
+import 'remote/app_updater.dart';
+import 'remote/google_token_provider.dart' show RemoteServices;
+import 'remote/moderation_screen.dart';
+import 'remote/publish_ui.dart';
+import 'remote/remote_bootstrap.dart';
+import 'remote/shared_themes.dart';
 import 'youtube/playlist_save_logic.dart' show PlaylistTarget, encodeTargets, kDownloaderPlaylistsCacheKey;
 
 // ==========================================
@@ -706,6 +712,8 @@ void main() async {
   JobForegroundService.init();
   await ThemePhotos.instance.init();
   await UserThemes.instance.load(); // țările adăugate din "Alege tema"
+  await SharedThemes.instance.init(); // temele comune salvate local (offline)
+  await RemoteServices.loadCachedAdminFlag();
   await RadioFavorites.instance.load();
   LibraryEvents.onPlaylistChanged = GlobalAudioState.instance.refreshPlaylistFromDisk;
   LibraryEvents.onPlaylistRemoved = (title) async {
@@ -732,6 +740,7 @@ class MusicSyncApp extends StatelessWidget {
 
     return MaterialApp(
       title: 'MusicSync',
+      navigatorKey: AppUpdater.navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: themeProvider.themeData,
       builder: (context, child) => AutoThemeBinder(child: child ?? const SizedBox.shrink()),
@@ -764,6 +773,8 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
     WidgetsBinding.instance.addObserver(this);
     _ensureNotificationPermission();
     _loadUserEmail();
+    // Actualizări + teme comune: în fundal, la ~5 s după pornire, apoi la 6 ore.
+    RemoteBootstrap.start();
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen((results) {
       setState(() {
         _isOffline = results.contains(ConnectivityResult.none);
@@ -777,6 +788,7 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
   /// permisiunea se pierde, deci o cerem la fiecare pornire dacă lipsește.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) RemoteBootstrap.onResumed();
     // Revenit din Setări -> actualizăm bannerul fără să mai întrebăm.
     if (state == AppLifecycleState.resumed && _notificationsDenied && Platform.isAndroid) {
       Permission.notification.status.then((status) {
@@ -838,6 +850,12 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
               onTap: () => Navigator.pop(c, 'edit'),
             ),
             ListTile(
+              leading: const Icon(Icons.public),
+              title: const Text('Publică pentru toți'),
+              subtitle: const Text('Trimite tema la moderare, ca să apară la toți utilizatorii'),
+              onTap: () => Navigator.pop(c, 'publish'),
+            ),
+            ListTile(
               leading: const Icon(Icons.delete, color: Colors.redAccent),
               title: const Text('Șterge țara'),
               onTap: () => Navigator.pop(c, 'delete'),
@@ -849,6 +867,8 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
     if (!sheetContext.mounted) return;
     if (action == 'edit') {
       await _openAddCountry(sheetContext, existing: spec);
+    } else if (action == 'publish') {
+      await publishUserCountry(sheetContext, spec);
     } else if (action == 'delete') {
       final ok = await showDialog<bool>(
         context: sheetContext,
@@ -912,6 +932,15 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                       ),
                     ],
                   ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      style: TextButton.styleFrom(foregroundColor: Colors.white70),
+                      icon: const Icon(Icons.outbox, size: 18),
+                      label: const Text('Trimiterile mele'),
+                      onPressed: () => Navigator.push(ctx, MaterialPageRoute(builder: (_) => const MySubmissionsScreen())),
+                    ),
+                  ),
                   Consumer<ThemeProvider>(
                     builder: (context, provider, _) => SwitchListTile(
                       contentPadding: const EdgeInsets.symmetric(horizontal: 20),
@@ -927,7 +956,7 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                   const SizedBox(height: 8),
                   Expanded(
                     child: AnimatedBuilder(
-                      animation: Listenable.merge([ThemePhotos.instance, UserThemes.instance]),
+                      animation: Listenable.merge([ThemePhotos.instance, UserThemes.instance, SharedThemes.instance]),
                       builder: (context, _) {
                       // Temele incluse + țările adăugate de utilizator.
                       final themes = [
@@ -935,6 +964,11 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                         for (final spec in UserThemes.instance.specs)
                           if (appThemes[spec.id] != null)
                             (spec.id, spec.name, spec.emoji, spec.accentColor, appThemes[spec.id]!.scaffoldBackground),
+                        // Temele comune (🌍), aprobate de moderator.
+                        for (final r in SharedThemes.instance.communityThemes)
+                          if (appThemes[r.appThemeId] != null)
+                            (r.appThemeId, r.entry.name, SharedThemes.instance.emojiFor(r.entry),
+                                appThemes[r.appThemeId]!.accentColor, appThemes[r.appThemeId]!.scaffoldBackground),
                       ];
                       return ListView.builder(
                       controller: controller,
@@ -958,6 +992,7 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                         }
                         final t = themes[i];
                         final userSpec = UserThemes.instance.specFor(t.$1);
+                        final isCommunity = SharedThemes.instance.isCommunityTheme(t.$1);
                         final id = t.$1; final name = t.$2; final emoji = t.$3;
                         final accent = t.$4; final bg = t.$5;
                         final photos = ThemePhotos.instance.photosFor(appThemes[id]!).take(7).toList();
@@ -999,7 +1034,16 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
                                     child: Row(
                                       children: [
                                         Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
-                                          Text(emoji, style: const TextStyle(fontSize: 28)),
+                                          Row(mainAxisSize: MainAxisSize.min, children: [
+                                            Text(emoji, style: const TextStyle(fontSize: 28)),
+                                            if (isCommunity)
+                                              Container(
+                                                margin: const EdgeInsets.only(left: 8),
+                                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                                decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+                                                child: const Text('🌍 Comunitate', style: TextStyle(color: Colors.white, fontSize: 11)),
+                                              ),
+                                          ]),
                                           const SizedBox(height: 4),
                                           Text(name, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold, shadows: [Shadow(color: Colors.black, blurRadius: 8)])),
                                         ]),
@@ -1087,7 +1131,42 @@ class _MainHubScreenState extends State<MainHubScreen> with WidgetsBindingObserv
             onPressed: _showThemePicker,
             tooltip: "Schimbă Tema",
           ),
-          const SizedBox(width: 8),
+          ValueListenableBuilder<bool>(
+            valueListenable: RemoteServices.isAdmin,
+            builder: (context, isAdmin, _) => PopupMenuButton<String>(
+              tooltip: 'Mai multe',
+              onOpened: () {
+                // Steagul de admin se reîmprospătează în fundal (fără conectare).
+                if (GoogleAuthManager.lastCredentials != null) RemoteServices.refreshAdminFlag();
+              },
+              onSelected: (value) {
+                switch (value) {
+                  case 'update':
+                    AppUpdater.checkManually(context);
+                  case 'submissions':
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => const MySubmissionsScreen()));
+                  case 'moderation':
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => const ModerationScreen()));
+                }
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'update',
+                  child: ListTile(leading: Icon(Icons.system_update), title: Text('Verifică actualizări'), contentPadding: EdgeInsets.zero),
+                ),
+                const PopupMenuItem(
+                  value: 'submissions',
+                  child: ListTile(leading: Icon(Icons.outbox), title: Text('Trimiterile mele'), contentPadding: EdgeInsets.zero),
+                ),
+                if (isAdmin)
+                  const PopupMenuItem(
+                    value: 'moderation',
+                    child: ListTile(leading: Icon(Icons.admin_panel_settings), title: Text('Moderare'), contentPadding: EdgeInsets.zero),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 4),
         ],
       ),
       body: SafeArea(

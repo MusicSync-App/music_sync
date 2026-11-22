@@ -27,10 +27,15 @@ const Map<String, String> kCountryCodeToTheme = {
   'TM': 'central asia',
 };
 
+/// Prioritate: țara adăugată de utilizator > tema comună (comunitate) >
+/// maparea inclusă în aplicație.
 String themeForCountryCode(String? countryCode) {
   final code = (countryCode ?? '').toUpperCase();
   // O țară adăugată de utilizator are prioritate (ex. "Serbia" separat de Bosnia).
   for (final rule in _customRules.values) {
+    if (rule.countryCode == code) return rule.themeId;
+  }
+  for (final rule in _sharedRules.values) {
     if (rule.countryCode == code) return rule.themeId;
   }
   return kCountryCodeToTheme[code] ?? kDefaultThemeId;
@@ -70,6 +75,24 @@ void unregisterCustomTheme(String themeId) => _customRules.remove(themeId);
 
 /// Pentru teste.
 void clearCustomThemes() => _customRules.clear();
+
+// ── Teme comune (aprobate pe server, sincronizate) ──────────────────────────
+
+final Map<String, _CustomRule> _sharedRules = {};
+
+/// Regulile unei teme comune. Pentru o intrare `builtin` [themeId] e cheia
+/// temei incluse (ex. 'grecia') — cuvintele ei se adaugă la cele incluse.
+void registerSharedTheme(String themeId, {String? countryCode, Iterable<String> keywords = const []}) {
+  final words = keywords.map((k) => k.trim()).where((k) => k.length >= 2).toSet();
+  final cc = countryCode?.toUpperCase();
+  _sharedRules[themeId] = _CustomRule(
+    themeId,
+    (cc == null || cc.isEmpty) ? null : cc,
+    words.map(customKeywordPattern).toList(),
+  );
+}
+
+void clearSharedThemes() => _sharedRules.clear();
 
 /// Cuvinte-cheie (fragmente regex, potrivite la începutul unui cuvânt).
 const Map<String, List<String>> _keywords = {
@@ -142,7 +165,14 @@ Set<String> _keywordHits(String text) {
   _keywordPatterns.forEach((themeId, patterns) {
     if (patterns.any((r) => r.hasMatch(text))) hits.add(themeId);
   });
+  final userCountries = <String>{};
   for (final rule in _customRules.values) {
+    if (rule.countryCode != null) userCountries.add(rule.countryCode!);
+    if (rule.patterns.any((r) => r.hasMatch(text))) hits.add(rule.themeId);
+  }
+  for (final rule in _sharedRules.values) {
+    // Țara proprie a utilizatorului bate tema comună a aceleiași țări.
+    if (rule.countryCode != null && userCountries.contains(rule.countryCode)) continue;
     if (rule.patterns.any((r) => r.hasMatch(text))) hits.add(rule.themeId);
   }
   return hits;

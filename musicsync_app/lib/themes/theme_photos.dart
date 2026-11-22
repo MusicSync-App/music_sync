@@ -17,15 +17,26 @@ class ThemePhoto {
   final String? assetPath;
   final File? file;
 
-  const ThemePhoto.asset(String this.assetPath) : file = null;
-  const ThemePhoto.file(File this.file) : assetPath = null;
+  /// Poză dintr-o temă comună (comunitate) — nu poate fi ștearsă local.
+  final bool isShared;
 
-  bool get isUserPhoto => file != null;
+  const ThemePhoto.asset(String this.assetPath)
+      : file = null,
+        isShared = false;
+  const ThemePhoto.file(File this.file)
+      : assetPath = null,
+        isShared = false;
+  const ThemePhoto.shared(File this.file)
+      : assetPath = null,
+        isShared = true;
+
+  bool get isUserPhoto => file != null && !isShared;
 
   ImageProvider get image => file != null ? FileImage(file!) : AssetImage(assetPath!) as ImageProvider;
 
   @override
-  bool operator ==(Object other) => other is ThemePhoto && other.assetPath == assetPath && other.file?.path == file?.path;
+  bool operator ==(Object other) =>
+      other is ThemePhoto && other.assetPath == assetPath && other.file?.path == file?.path && other.isShared == isShared;
 
   @override
   int get hashCode => Object.hash(assetPath, file?.path);
@@ -57,6 +68,17 @@ class ThemePhotos extends ChangeNotifier {
   Map<String, List<String>> _assets = {};
   String? _userRoot;
 
+  /// Pozele temelor comune, după ID-ul temei (setate de SharedThemes).
+  Map<String, List<File>> _shared = {};
+
+  void setSharedPhotos(Map<String, List<File>> byThemeId) {
+    _shared = byThemeId;
+    notifyListeners();
+  }
+
+  List<File> sharedPhotosFor(CountryTheme theme) =>
+      [for (final f in _shared[theme.id] ?? const <File>[]) if (f.existsSync()) f];
+
   Future<void> init() async {
     try {
       final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
@@ -81,6 +103,7 @@ class ThemePhotos extends ChangeNotifier {
 
   List<ThemePhoto> photosFor(CountryTheme theme) => [
         for (final a in _assets[theme.photoFolder] ?? const <String>[]) ThemePhoto.asset(a),
+        for (final f in sharedPhotosFor(theme)) ThemePhoto.shared(f),
         for (final f in userPhotosFor(theme)) ThemePhoto.file(f),
       ];
 
